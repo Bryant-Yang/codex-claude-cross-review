@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Claude Cross Review"
+  short_description: "Run structured two-model code, design, architecture, and documentation reviews"
+  default_prompt: "Use $codex-claude-cross-review to review my current change or design with Codex and Claude."
