@@ -1,6 +1,6 @@
 ---
 name: codex-claude-cross-review
-description: Use when the user wants Codex and Claude Code to review the same code, design, plan, diff, branch, commit, pull request, or implementation from independent perspectives; trigger for two-model review, cross-review, adversarial review, second-opinion review, Codex Claude 互相 review, 双模型 review, 交叉评审, 互审, or resolving disagreement between AI reviewers.
+description: Trigger when the user asks for 交叉review, 交叉 review, 交叉评审, 互评, 互审, 互相review, 双模型review, 双模型评审, two-model review, cross-review, or asks Codex and Claude / Claude Code to both review the same code, design, plan, diff, branch, commit, PR, or document and challenge each other's findings.
 ---
 
 # Codex Claude Cross Review
