@@ -1,6 +1,8 @@
 # Codex Claude Cross Review
 
-让 Codex 和 Claude Code 对同一个任务做交叉评审的 Codex skill。
+让 Codex 和 Claude Code 对同一个任务做交叉评审的本地 review workflow。
+
+它可以作为 Codex skill 使用，也可以在 Claude Code 里直接按这个仓库的说明运行脚本。
 
 它适合用来 review：
 
@@ -12,11 +14,21 @@
 
 ## 安装
 
-把这个 GitHub 仓库交给你的 agent，让它安装这个技能即可：
+把这个 GitHub 仓库交给你的 agent，让它安装或使用即可。
+
+Codex 里可以这样说：
 
 ```text
 请安装这个 Codex skill：
 https://github.com/Bryant-Yang/codex-claude-cross-review
+```
+
+Claude Code 里可以这样说：
+
+```text
+请使用这个仓库里的 cross review workflow：
+https://github.com/Bryant-Yang/codex-claude-cross-review
+安装到本机后，用它来让 Codex 和 Claude Code 双模型 review 当前项目。
 ```
 
 如果手动安装，放到 Codex skills 目录：
@@ -25,6 +37,12 @@ https://github.com/Bryant-Yang/codex-claude-cross-review
 mkdir -p ~/.agents/skills
 git clone https://github.com/Bryant-Yang/codex-claude-cross-review \
   ~/.agents/skills/codex-claude-cross-review
+```
+
+如果只想在 Claude Code 里当普通工具用，也可以 clone 到任意目录：
+
+```bash
+git clone https://github.com/Bryant-Yang/codex-claude-cross-review
 ```
 
 ## 怎么触发
@@ -47,6 +65,12 @@ git clone https://github.com/Bryant-Yang/codex-claude-cross-review \
 
 ```text
 请用这个 skill review 当前分支相对 main 的改动
+```
+
+在 Claude Code 里也可以这样说：
+
+```text
+请用 codex-claude-cross-review 这个仓库里的脚本，双模型 review 当前改动
 ```
 
 skill 会自动判断是代码、设计、架构、文档还是混合 review。  
@@ -74,6 +98,14 @@ skill 会自动判断是代码、设计、架构、文档还是混合 review。
 
 ```bash
 python3 ~/.agents/skills/codex-claude-cross-review/scripts/cross_review.py \
+  --repo "$(pwd)" \
+  --mode uncommitted
+```
+
+如果是在 Claude Code 里 clone 到普通目录，把脚本路径换成实际路径即可：
+
+```bash
+python3 /path/to/codex-claude-cross-review/scripts/cross_review.py \
   --repo "$(pwd)" \
   --mode uncommitted
 ```
