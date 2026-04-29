@@ -63,6 +63,22 @@ python3 ~/.agents/skills/codex-claude-cross-review/scripts/cross_review.py \
   --mode uncommitted
 ```
 
+快速 review：
+
+```bash
+python3 ~/.agents/skills/codex-claude-cross-review/scripts/cross_review.py \
+  --repo "$(pwd)" \
+  --profile fast
+```
+
+深度 review：
+
+```bash
+python3 ~/.agents/skills/codex-claude-cross-review/scripts/cross_review.py \
+  --repo "$(pwd)" \
+  --profile deep
+```
+
 Claude Code 路径下运行：
 
 ```bash
@@ -82,8 +98,9 @@ python3 ~/.claude/skills/codex-claude-cross-review/scripts/cross_review.py \
 - `progress.log`
 - `review-summary.md`
 - `arbitration.md`
+- `reviewer-outputs.md`：只有需要完整 reviewer 原文时再看
 
-依赖：`python3`、`git`、`codex`、`claude`。脚本本身只用 Python 标准库。
+依赖：`python3 >= 3.10`、`git`、`codex`、`claude`。脚本本身只用 Python 标准库。
 
 ## License
 

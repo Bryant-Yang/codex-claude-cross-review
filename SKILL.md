@@ -20,7 +20,10 @@ python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_rev
   --task "Review the current changes against the user's request."
 ```
 
+Requires `python3 >= 3.10`, `git`, `codex`, and `claude`.
+
 Use `--mode base --base main` for branch review, `--mode commit --commit <sha>` for one commit, or `--diff-file <path>` when the diff was supplied externally.
+Use `--profile fast` for low-cost daily review, default `--profile normal` for full cross-review, and `--profile deep` for high-risk or disputed changes. Explicit `--scope`, `--rounds`, and context-size flags override profile defaults.
 The default `--scope auto` preserves the actual diff for active changes. When the task asks for whole/design/architecture review, the script uses `diff+full`: the before/after diff plus selected repository context. It uses pure full-context review only when there is no meaningful diff or the user explicitly reviews repository state. Override with `--scope diff` or `--scope full`.
 
 The default `--review-type auto` selects a review lens from the task and context:
@@ -47,6 +50,7 @@ The script writes a timestamped report directory under `.agent-review/` by defau
   claude-final.md         # only with --rounds 3
   review-summary.md       # per-round status and key points
   arbitration.md
+  reviewer-outputs.md     # full raw reviewer text
   progress.log            # timestamped execution progress
   run.json
 ```
@@ -54,10 +58,10 @@ The script writes a timestamped report directory under `.agent-review/` by defau
 Report directories can accumulate. By default, only timestamped default runs with this script's marker or valid `run.json` are pruned after each execution, and the latest 10 are kept. Custom output directories are never pruned automatically.
 Use `--keep-runs <n>` to change the retention count, `--keep-runs -1` or `--no-prune-reports` to keep all runs, and `--reports-dir <path>` to move generated reports outside the repo worktree. The script rejects non-empty custom `--out` directories unless `--force-output` is passed.
 
-Default `--rounds 2` means independent review plus one exchange. Use `--rounds 3` when the first exchange leaves disputed findings; the third round is a final convergence pass over disputes and new high-risk issues only.
+Default `--profile normal` resolves to `--rounds 2`: independent review plus one exchange. In round 2, each reviewer receives its own first review and the peer review, then emits an updated position. Use `--profile fast` or `--rounds 1` for cheaper first-pass review. Use `--profile deep` or `--rounds 3` when the first exchange leaves disputed findings; the third round uses compacted round-2 positions instead of all raw prior outputs.
 Within each round, Codex and Claude run in parallel when both reviewers are available. Rounds remain sequential because round 2 depends on round 1 outputs and round 3 depends on prior review material.
 
-The script filters `.agent-review/` from untracked-file collection so prior reports do not pollute later reviews.
+The script filters `.agent-review/` from untracked-file collection so prior reports do not pollute later reviews. `arbitration.md` contains the concise decision view; full reviewer text is in `reviewer-outputs.md` and should only be read when raw detail is needed.
 Progress is printed to stderr during execution and written to `progress.log`; `review-summary.md` gives the concise per-round review highlights.
 `review-summary.md` is refreshed after every reviewer finishes, so it is safe to read while the review is still running.
 
@@ -79,12 +83,14 @@ Require both reviewers to follow this contract:
 Use this decision rule before running the script:
 
 - Active implementation change: use default auto scope, which normally resolves to diff review.
+- Small or routine change: use `--profile fast`.
 - Branch or PR review: use `--mode base --base <base>` and keep auto scope. If the user asks for whole-system/design/architecture review, auto resolves to `diff+full`, not full instead of diff.
 - One commit: use `--mode commit --commit <sha>`.
 - Design, architecture, plan, or documentation review without a meaningful diff: use default auto scope or explicit `--scope full`.
+- High-risk or disputed review: use `--profile deep`.
 - Large repository or unclear task: prefer `--scope diff` with a precise task, then run a second focused full review only if the first pass exposes context gaps.
 
-The script records the resolved scope and review type in `review-summary.md`, `arbitration.md`, and `run.json`.
+The script records the profile, resolved scope, and review type in `review-summary.md`, `arbitration.md`, and `run.json`.
 
 ## Method
 
@@ -108,8 +114,8 @@ codex exec --cd "$REPO" --sandbox read-only --json --skip-git-repo-check - < pro
 claude -p --output-format json --max-turns 8 --tools "" < prompt.md
 ```
 
-5. Give Claude's review to Codex and Codex's review to Claude for a second pass.
-6. Optionally run a third pass over only disputed or newly raised high-risk issues.
+5. Give each reviewer its own first review plus the peer review for a second pass.
+6. Optionally run a third pass over compacted second-pass positions only.
 7. Produce a final `arbitration.md` listing candidate or final issues, disputed issues, blocked reviewers, needs-human items, and the recommended next action.
 
 ## Failure Handling
@@ -126,6 +132,9 @@ claude -p --output-format json --max-turns 8 --tools "" < prompt.md
 # Review all uncommitted changes.
 python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --mode uncommitted
 
+# Run a cheaper first-pass review.
+python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --profile fast
+
 # Review whole repo context for design or architecture problems.
 python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --scope full --review-type architecture
 
@@ -136,7 +145,7 @@ python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_rev
 python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --mode commit --commit HEAD
 
 # Run a three-round review when disagreement needs convergence.
-python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --mode uncommitted --rounds 3
+python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --profile deep
 
 # Run only the available side while diagnosing local auth.
 python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --skip-claude
@@ -148,7 +157,7 @@ python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_rev
 ## Report Back
 
 Summarize the final result in Chinese. Include the report directory, each reviewer's status, the top agreed findings, disputed findings, and any blocked reviewer. Do not paste huge raw outputs unless the user asks.
-Prefer reading `review-summary.md` first, then `arbitration.md`, then the raw per-reviewer files only when detail is needed.
+Prefer reading `review-summary.md` first, then `arbitration.md`, then `reviewer-outputs.md` only when raw reviewer text is needed.
 
 When running this skill for a user in Codex, do not rely on hidden tool output. After starting the script, relay progress to the user by reading `progress.log` and `review-summary.md` as they update. At minimum, report:
 
@@ -156,3 +165,4 @@ When running this skill for a user in Codex, do not rely on hidden tool output. 
 - when each round starts,
 - each reviewer status and key points after that reviewer finishes,
 - the final `arbitration.md` location.
+- the `reviewer-outputs.md` location only when raw reviewer text is needed.
