@@ -204,21 +204,24 @@ def is_excluded_repo_path(path: str, excludes: set[str]) -> bool:
     return any(normalized == item or normalized.startswith(item.rstrip("/") + "/") for item in excludes)
 
 
-def collect_untracked(repo: Path, max_chars: int, max_files: int, max_file_bytes: int, excludes: set[str] | None = None) -> str:
+def collect_untracked(repo: Path, max_chars: int, max_files: int, max_file_bytes: int, excludes: set[str] | None = None) -> tuple[str, bool]:
     excludes = excludes or {".agent-review"}
     names = git_text(repo, ["ls-files", "--others", "--exclude-standard"]).splitlines()
     names = [name for name in names if not is_excluded_repo_path(name, excludes)]
     if not names:
-        return ""
+        return "", False
 
     chunks = ["\n\n## Untracked files\n"]
     remaining = max_chars
+    truncated = False
     for index, name in enumerate(names):
         if index >= max_files:
             chunks.append(f"\n[untracked file list truncated after {max_files} files]\n")
+            truncated = True
             break
         if remaining <= 0:
             chunks.append("\n[untracked file content budget exhausted]\n")
+            truncated = True
             break
         path = repo / name
         chunks.append(f"\n### {name}\n")
@@ -231,6 +234,7 @@ def collect_untracked(repo: Path, max_chars: int, max_files: int, max_file_bytes
         size = path.stat().st_size
         if size > max_file_bytes:
             chunks.append(f"[file omitted: {size} bytes exceeds per-file limit of {max_file_bytes}]\n")
+            truncated = True
             continue
         try:
             with path.open("r", encoding="utf-8") as handle:
@@ -243,8 +247,9 @@ def collect_untracked(repo: Path, max_chars: int, max_files: int, max_file_bytes
         remaining -= take
         if remaining <= 0:
             chunks.append("\n[untracked file content truncated]\n")
+            truncated = True
             break
-    return "".join(chunks)
+    return "".join(chunks), truncated
 
 
 def infer_review_type(requested: str, task: str, context: str = "") -> str:
@@ -305,7 +310,7 @@ def rank_context_file(path: str) -> tuple[int, str]:
     return (2, path)
 
 
-def collect_full_context(repo: Path, max_chars: int, max_files: int, max_file_bytes: int, excludes: set[str] | None = None) -> str:
+def collect_full_context(repo: Path, max_chars: int, max_files: int, max_file_bytes: int, excludes: set[str] | None = None) -> tuple[str, bool]:
     tracked = git_text(repo, ["ls-files"]).splitlines()
     names = sorted([name for name in tracked if should_include_file(name, excludes)], key=rank_context_file)
     status = git_text(repo, ["status", "--short"])
@@ -328,12 +333,15 @@ def collect_full_context(repo: Path, max_chars: int, max_files: int, max_file_by
     ]
     remaining = max_chars - sum(len(part) for part in chunks)
     processed = 0
+    truncated = False
     for name in names:
         if processed >= max_files:
             chunks.append(f"\n[full review file content truncated after {max_files} files]\n")
+            truncated = True
             break
         if remaining <= 0:
             chunks.append("\n[full review content budget exhausted]\n")
+            truncated = True
             break
         processed += 1
         path = repo / name
@@ -347,6 +355,7 @@ def collect_full_context(repo: Path, max_chars: int, max_files: int, max_file_by
         size = path.stat().st_size
         if size > max_file_bytes:
             chunks.append(f"[file omitted: {size} bytes exceeds per-file limit of {max_file_bytes}]\n")
+            truncated = True
             continue
         try:
             with path.open("r", encoding="utf-8") as handle:
@@ -357,8 +366,12 @@ def collect_full_context(repo: Path, max_chars: int, max_files: int, max_file_by
         take = max(0, min(len(data), remaining))
         chunks.append("```text\n" + data[:take] + "\n```\n")
         remaining -= take
+        if len(data) > take:
+            chunks.append("\n[full review file content truncated]\n")
+            truncated = True
+            break
     if remaining > 0:
-        untracked = collect_untracked(
+        untracked, untracked_truncated = collect_untracked(
             repo,
             max_chars=min(remaining, max_chars // 3),
             max_files=30,
@@ -367,7 +380,8 @@ def collect_full_context(repo: Path, max_chars: int, max_files: int, max_file_by
         )
         if untracked:
             chunks.append(untracked)
-    return "\n".join(chunks)
+        truncated = truncated or untracked_truncated
+    return "\n".join(chunks), truncated
 
 
 def collect_diff(args: argparse.Namespace, repo: Path) -> tuple[str, dict[str, Any]]:
@@ -387,13 +401,15 @@ def collect_diff(args: argparse.Namespace, repo: Path) -> tuple[str, dict[str, A
     full_requested = args.scope == "full" or (args.scope == "auto" and wants_full_review(args.task_text))
 
     def full_context() -> str:
-        return collect_full_context(
+        context, truncated = collect_full_context(
             repo,
             max_chars=args.max_full_chars,
             max_files=args.max_full_files,
             max_file_bytes=args.max_full_file_bytes,
             excludes=args.report_excludes,
         )
+        meta["collection_truncated"] = bool(meta.get("collection_truncated")) or truncated
+        return context
 
     def with_optional_full_context(diff_text: str) -> str:
         if not full_requested:
@@ -410,7 +426,7 @@ def collect_diff(args: argparse.Namespace, repo: Path) -> tuple[str, dict[str, A
             return full_context(), meta
         staged, staged_truncated = run_cmd_limited(["git", "diff", "--staged", "--find-renames"], repo, max_chars=args.max_diff_chars, timeout=120)
         unstaged, unstaged_truncated = run_cmd_limited(["git", "diff", "--find-renames"], repo, max_chars=args.max_diff_chars, timeout=120)
-        untracked = collect_untracked(
+        untracked, untracked_truncated = collect_untracked(
             repo,
             max_chars=args.max_untracked_chars,
             max_files=args.max_untracked_files,
@@ -419,7 +435,7 @@ def collect_diff(args: argparse.Namespace, repo: Path) -> tuple[str, dict[str, A
         )
         diff = f"# git status --short\n\n```text\n{status}```\n\n# staged diff\n\n```diff\n{staged}```\n\n# unstaged diff\n\n```diff\n{unstaged}```\n{untracked}"
         meta["status_short"] = status
-        meta["collection_truncated"] = staged_truncated or unstaged_truncated
+        meta["collection_truncated"] = staged_truncated or unstaged_truncated or untracked_truncated
         return with_optional_full_context(diff), meta
 
     if args.mode == "base":
@@ -503,7 +519,7 @@ You are {reviewer}, making a second-pass review.
 
 Review only. Do not edit files, apply patches, commit, or run destructive commands.
 Your previous independent review and the peer review are provided below.
-Produce an updated position: keep your previous findings that still stand, correct or retract findings disproven by the peer review or diff, challenge unsupported peer findings, and add new findings only when they are concrete and file-grounded.
+Produce an updated position: keep your previous findings that still stand, put corrected or retracted previous findings in a separate section, challenge unsupported peer findings, and add new findings only when they are concrete and file-grounded.
 Use the requested review type and lens below.
 
 Review type: {review_type}
@@ -517,8 +533,10 @@ STATUS: PASS | NEEDS_REVISION | BLOCKED
 ## Scope
 - What you reviewed.
 
-## Updated Position
+## Still Standing Own Findings
 - Findings from your previous review that still stand.
+
+## Retracted Own Findings
 - Findings from your previous review that you retract or revise.
 
 ## Confirmed Peer Findings
@@ -810,7 +828,7 @@ def result_brief(name: str, result: dict[str, Any], limit: int = 4) -> str:
         return f"{name}: {status} - {first_error(result) or 'no reviewer output'}"
     points = section_key_points(
         result.get("text", ""),
-        ["## Confirmed Issues", "## Updated Position", "## Confirmed Peer Findings", "## New Findings", "## Findings", "## Final Position", "## Notes"],
+        ["## Confirmed Issues", "## Still Standing Own Findings", "## Confirmed Peer Findings", "## New Findings", "## Findings", "## Final Position", "## Notes"],
         limit=limit,
     )
     if not points:
@@ -822,6 +840,8 @@ def compact_review_text(text: str, max_chars: int = 6000) -> str:
     sections = []
     for heading in (
         "## Final Position",
+        "## Still Standing Own Findings",
+        "## Retracted Own Findings",
         "## Updated Position",
         "## Confirmed Issues",
         "## Rejected Issues",
@@ -887,7 +907,7 @@ def build_review_summary(results: dict[str, dict[str, Any]], meta: dict[str, Any
                 lines.append(f"- Blocked: {first_error(result) or 'no reviewer output'}")
             points = section_key_points(
                 result.get("text", ""),
-                ["## Confirmed Issues", "## Updated Position", "## Confirmed Peer Findings", "## New Findings", "## Findings", "## Final Position", "## Notes"],
+                ["## Confirmed Issues", "## Still Standing Own Findings", "## Confirmed Peer Findings", "## New Findings", "## Findings", "## Final Position", "## Notes"],
                 limit=6,
             )
             if points:
@@ -1003,10 +1023,10 @@ def build_arbitration(results: dict[str, dict[str, Any]], truncated: bool, meta:
     if not final_sections:
         for key in ("codex_response", "claude_response"):
             text = results.get(key, {}).get("text", "")
-            updated = extract_section(text, "## Updated Position")
+            still_standing = extract_section(text, "## Still Standing Own Findings")
             confirmed = extract_section(text, "## Confirmed Peer Findings")
             new_findings = extract_section(text, "## New Findings")
-            section = "\n\n".join(part for part in (updated, confirmed, new_findings) if part)
+            section = "\n\n".join(part for part in (still_standing, confirmed, new_findings) if part)
             append_contentful_section(final_sections, f"### {key} confirmed/new findings", section)
     if not final_sections:
         for key in ("codex_initial", "claude_initial"):
