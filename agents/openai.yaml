@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Claude Cross Review"
-  short_description: "Trigger on 交叉review or 交叉评审 to run Codex+Claude two-model review"
-  default_prompt: "请用 Codex 和 Claude 双模型交叉 review 当前改动。"
+  short_description: "Trigger on 交叉review or 交叉评审 for Codex+Claude review of code, docs, design, or plans"
+  default_prompt: "请用 Codex 和 Claude 双模型交叉 review 当前任务，并输出仲裁结论。"

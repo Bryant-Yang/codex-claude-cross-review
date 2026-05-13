@@ -7,7 +7,7 @@ description: Trigger when the user asks for 交叉review, 交叉 review, 交叉�
 
 ## Overview
 
-Run Codex and Claude Code as separate reviewers over the same task and review context, then exchange their findings so each model can challenge the other. Keep the workflow review-only by default; one active agent owns any later edits.
+Run Codex and Claude Code as separate reviewers over the same task and review context, then exchange their findings so each model can challenge the other. The task may be code, design, architecture, documentation, plan, branch, commit, or current-state review. Keep the workflow review-only by default; one active agent owns any later edits.
 
 ## Default Workflow
 
@@ -24,6 +24,8 @@ Requires `python3 >= 3.10`, `git`, `codex`, and `claude`.
 
 Use `--mode base --base main` for branch review, `--mode commit --commit <sha>` for one commit, or `--diff-file <path>` when the diff was supplied externally.
 Use `--profile fast` for low-cost daily review, default `--profile normal` for full cross-review, and `--profile deep` for high-risk or disputed changes. Explicit `--scope`, `--rounds`, and context-size flags override profile defaults.
+Use `--arbiter codex` or `--arbiter claude` only when you need an extra model to synthesize deduplicated finding cards. The default is `--arbiter none`, so normal runs do not pay for a third synthesis call.
+All profiles default Claude Code to diff/context-only review with tools disabled. Use `--claude-tools default` only when you intentionally want Claude Code to use its default tool set for evidence inspection; that depends on Claude Code's own permission configuration and is not a script-level read-only sandbox.
 The default `--scope auto` preserves the actual diff for active changes. When the task asks for whole/design/architecture review, the script uses `diff+full`: the before/after diff plus selected repository context. It uses pure full-context review only when there is no meaningful diff or the user explicitly reviews repository state. Override with `--scope diff` or `--scope full`.
 
 The default `--review-type auto` selects a review lens from the task and context:
@@ -49,8 +51,11 @@ The script writes a timestamped report directory under `.agent-review/` by defau
   codex-final.md          # only with --rounds 3
   claude-final.md         # only with --rounds 3
   review-summary.md       # per-round status and key points
+  findings.json           # structured and deduplicated finding cards
   arbitration.md
+  recommended-actions.md  # action-oriented view grouped by review type
   reviewer-outputs.md     # full raw reviewer text
+  arbiter.md              # only with --arbiter codex|claude
   progress.log            # timestamped execution progress
   run.json
 ```
@@ -58,9 +63,10 @@ The script writes a timestamped report directory under `.agent-review/` by defau
 Report directories can accumulate. By default, only timestamped default runs with this script's marker or valid `run.json` are pruned after each execution, and the latest 10 are kept. Custom output directories are never pruned automatically.
 Use `--keep-runs <n>` to change the retention count, `--keep-runs -1` or `--no-prune-reports` to keep all runs, and `--reports-dir <path>` to move generated reports outside the repo worktree. The script rejects non-empty custom `--out` directories unless `--force-output` is passed.
 
-Default `--profile normal` resolves to `--rounds 2`: independent review plus one exchange. In round 2, each reviewer receives its own first review and the peer review, then emits an updated position with still-standing findings separated from retracted findings. Use `--profile fast` or `--rounds 1` for cheaper first-pass review. Use `--profile deep` or `--rounds 3` when the first exchange leaves disputed findings; the third round uses compacted round-2 positions instead of all raw prior outputs.
+Default `--profile normal` resolves to `--rounds 2`: independent review plus one exchange. In round 2, each reviewer receives its own first review and the peer review, then emits an updated position with still-standing findings separated from retracted findings. Use `--profile fast` or `--rounds 1` for cheaper first-pass review. Use `--profile deep` or `--rounds 3` when the first exchange leaves disputed findings; the third round is an optional reviewer convergence pass, not the arbiter. It uses compacted round-2 positions instead of all raw prior outputs.
 Within each round, Codex and Claude run in parallel when both reviewers are available. Rounds remain sequential because round 2 depends on round 1 outputs and round 3 depends on prior review material.
 
+After reviewer rounds finish, the script extracts general-purpose finding cards, deduplicates them across reviewers, writes `findings.json`, then builds `arbitration.md` and `recommended-actions.md`. Findings are not limited to `file:line`; documentation claims, architecture boundaries, design flows, and needs-human decisions are valid evidence shapes.
 The script filters `.agent-review/` from untracked-file collection so prior reports do not pollute later reviews. `arbitration.md` contains the concise decision view; full reviewer text is in `reviewer-outputs.md` and should only be read when raw detail is needed.
 Progress is printed to stderr during execution and written to `progress.log`; `review-summary.md` gives the concise per-round review highlights.
 `review-summary.md` is refreshed after every reviewer finishes, so it is safe to read while the review is still running.
@@ -76,6 +82,8 @@ Require both reviewers to follow this contract:
 - State `PASS`, `NEEDS_REVISION`, or `BLOCKED` explicitly.
 - When disagreeing with the other reviewer, name the exact finding and explain the evidence.
 - Use the selected review lens. Do not force a code-only review when the user asked for design, architecture, documentation, or plan review.
+- Inspect evidence relevant to the selected lens: call sites/tests for code, implementation state for docs, module boundaries/API/data flow for architecture, and components/flows/states for design.
+- If a reviewer does not have file/search tools, it should work from the supplied diff/context and state the evidence limit instead of repeatedly attempting unavailable tools.
 - Treat design preferences as required fixes only when they affect the stated goal, usability, accessibility, implementation feasibility, or consistency with existing product patterns.
 
 ## Scope Selection
@@ -87,10 +95,10 @@ Use this decision rule before running the script:
 - Branch or PR review: use `--mode base --base <base>` and keep auto scope. If the user asks for whole-system/design/architecture review, auto resolves to `diff+full`, not full instead of diff.
 - One commit: use `--mode commit --commit <sha>`.
 - Design, architecture, plan, or documentation review without a meaningful diff: use default auto scope or explicit `--scope full`.
-- High-risk or disputed review: use `--profile deep`.
+- High-risk or disputed review: use `--profile deep`; add `--arbiter codex` or `--arbiter claude` only when a final synthesis over finding cards is worth the extra model call.
 - Large repository or unclear task: prefer `--scope diff` with a precise task, then run a second focused full review only if the first pass exposes context gaps.
 
-The script records the profile, resolved scope, and review type in `review-summary.md`, `arbitration.md`, and `run.json`.
+The script records the profile, resolved scope, review type, and arbiter mode in `review-summary.md`, `arbitration.md`, `findings.json`, and `run.json`.
 
 ## Method
 
@@ -115,8 +123,9 @@ claude -p --output-format json --max-turns 8 --tools "" < prompt.md
 ```
 
 5. Give each reviewer its own first review plus the peer review for a second pass.
-6. Optionally run a third pass over compacted second-pass positions only.
-7. Produce a final `arbitration.md` listing candidate or final issues, disputed issues, blocked reviewers, needs-human items, and the recommended next action.
+6. Optionally run a third reviewer convergence pass over compacted second-pass positions only.
+7. Extract finding cards, deduplicate them, and produce `arbitration.md` plus `recommended-actions.md`.
+8. Optionally ask Codex or Claude to act as arbiter over the deduplicated finding cards, not the full raw review transcript.
 
 ## Failure Handling
 
@@ -147,6 +156,9 @@ python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_rev
 # Run a three-round review when disagreement needs convergence.
 python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --profile deep
 
+# Add a final model arbiter over deduplicated finding cards.
+python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --profile deep --arbiter codex
+
 # Run only the available side while diagnosing local auth.
 python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_review.py --repo "$(pwd)" --skip-claude
 
@@ -156,13 +168,14 @@ python3 /Users/yangbo/.agents/skills/codex-claude-cross-review/scripts/cross_rev
 
 ## Report Back
 
-Summarize the final result in Chinese. Include the report directory, each reviewer's status, the top agreed findings, disputed findings, and any blocked reviewer. Do not paste huge raw outputs unless the user asks.
-Prefer reading `review-summary.md` first, then `arbitration.md`, then `reviewer-outputs.md` only when raw reviewer text is needed.
+Summarize the final result in Chinese. Include the report directory, each reviewer's status, the top agreed findings, disputed findings, any blocked reviewer, and whether an arbiter ran. Do not paste huge raw outputs unless the user asks.
+Prefer reading `review-summary.md` first, then `arbitration.md` and `recommended-actions.md`, then `reviewer-outputs.md` only when raw reviewer text is needed.
 
 When running this skill for a user in Codex, do not rely on hidden tool output. After starting the script, relay progress to the user by reading `progress.log` and `review-summary.md` as they update. At minimum, report:
 
 - the report directory as soon as it is created,
 - when each round starts,
 - each reviewer status and key points after that reviewer finishes,
+- whether `findings.json` and `recommended-actions.md` were generated,
 - the final `arbitration.md` location.
 - the `reviewer-outputs.md` location only when raw reviewer text is needed.

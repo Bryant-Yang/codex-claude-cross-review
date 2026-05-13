@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
+import re
 import selectors
 import shutil
 import subprocess
@@ -20,6 +22,7 @@ PROFILE_DEFAULTS = {
     "fast": {
         "rounds": 1,
         "scope": "diff",
+        "claude_tools": "none",
         "max_diff_chars": 80_000,
         "max_full_chars": 120_000,
         "max_full_files": 60,
@@ -27,6 +30,7 @@ PROFILE_DEFAULTS = {
     "normal": {
         "rounds": 2,
         "scope": "auto",
+        "claude_tools": "none",
         "max_diff_chars": 180_000,
         "max_full_chars": 220_000,
         "max_full_files": 120,
@@ -34,6 +38,7 @@ PROFILE_DEFAULTS = {
     "deep": {
         "rounds": 3,
         "scope": "auto",
+        "claude_tools": "none",
         "max_diff_chars": 220_000,
         "max_full_chars": 260_000,
         "max_full_files": 160,
@@ -69,6 +74,21 @@ IMPORTANT_FILE_NAMES = {
     "requirements.txt",
     "Cargo.toml",
     "go.mod",
+}
+
+PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2}
+
+FINDING_SECTIONS = {
+    "## Findings": "one_sided",
+    "## Still Standing Own Findings": "one_sided",
+    "## Retracted Own Findings": "retracted",
+    "## Confirmed Peer Findings": "confirmed",
+    "## New Findings": "one_sided",
+    "## Confirmed Issues": "confirmed",
+    "## Rejected Peer Findings": "rejected",
+    "## Rejected Issues": "rejected",
+    "## Needs Human": "needs_human",
+    "## Questions": "needs_human",
 }
 
 
@@ -504,6 +524,19 @@ Review lens:
     return lenses.get(review_type, lenses["mixed"]).strip()
 
 
+def evidence_guidance() -> str:
+    return """
+Evidence inspection:
+- When tools are available, you may inspect repository files, search for related symbols or documents, and verify evidence relevant to the selected review lens.
+- If tools are unavailable, use the supplied diff/context, state the limitation, and do not repeatedly attempt unavailable tools.
+- For code review, inspect call sites, tests, contracts, and configuration when needed.
+- For documentation review, verify claims against implementation and repository state.
+- For architecture review, inspect module boundaries, APIs, data flow, docs, and deployment constraints.
+- For design review, inspect related components, flows, states, and consistency constraints.
+- Do not edit files, apply patches, commit, or run destructive commands.
+""".strip()
+
+
 def review_prompt(
     reviewer: str,
     task: str,
@@ -513,6 +546,7 @@ def review_prompt(
     own_review: str | None = None,
 ) -> str:
     lens = review_lens(review_type)
+    evidence = evidence_guidance()
     if peer_review:
         return f"""
 You are {reviewer}, making a second-pass review.
@@ -525,6 +559,8 @@ Use the requested review type and lens below.
 Review type: {review_type}
 
 {lens}
+
+{evidence}
 
 Use this exact Markdown structure:
 
@@ -592,6 +628,8 @@ Review type: {review_type}
 
 {lens}
 
+{evidence}
+
 Use this exact Markdown structure:
 
 STATUS: PASS | NEEDS_REVISION | BLOCKED
@@ -630,6 +668,7 @@ def final_prompt(reviewer: str, task: str, diff: str, review_type: str, prior_re
         f"## {name}\n\n{text}" for name, text in prior_reviews.items() if text.strip()
     )
     lens = review_lens(review_type)
+    evidence = evidence_guidance()
     return f"""
 You are {reviewer}, making the final cross-review pass.
 
@@ -644,6 +683,8 @@ Do not re-review the whole diff from scratch. Focus only on:
 Review type: {review_type}
 
 {lens}
+
+{evidence}
 
 Use this exact Markdown structure:
 
@@ -727,21 +768,41 @@ def run_claude(repo: Path, prompt: str, out_raw: Path, timeout: int, claude_tool
         result = run_cmd(cmd, repo, input_text=prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"ok": False, "text": "", "error": "claude timed out"}
-    raw = (result.stdout or "") + ("\n[stderr]\n" + result.stderr if result.stderr else "")
+    return parse_claude_result(result.returncode, result.stdout or "", result.stderr or "", out_raw)
+
+
+def parse_claude_result(returncode: int, stdout: str, stderr: str, out_raw: Path) -> dict[str, Any]:
+    raw = stdout + ("\n[stderr]\n" + stderr if stderr else "")
     out_raw.write_text(raw, encoding="utf-8")
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(stdout)
         text = payload.get("result") or ""
         is_error = bool(payload.get("is_error"))
         api_error = payload.get("api_error_status")
         if is_error:
-            blocked = f"STATUS: BLOCKED\n\n## Scope\n- Claude Code did not complete the review.\n\n## Findings\n- None.\n\n## Questions\n- Fix Claude Code authentication or organization access, then rerun this reviewer.\n\n## Notes\n- Error: {text or 'Claude returned an error.'}\n"
-            return {"ok": False, "text": blocked, "error": f"claude api error {api_error}"}
+            subtype = payload.get("subtype") or "error"
+            stop_reason = payload.get("stop_reason") or payload.get("terminal_reason") or ""
+            errors = payload.get("errors") or []
+            error_detail = text or "; ".join(str(item) for item in errors) or "Claude returned an error."
+            suffix = f" ({stop_reason})" if stop_reason else ""
+            blocked = f"STATUS: BLOCKED\n\n## Scope\n- Claude Code did not complete the review.\n\n## Findings\n- None.\n\n## Questions\n- Fix the Claude Code runtime issue, then rerun this reviewer.\n\n## Notes\n- Error: {error_detail}\n- Subtype: {subtype}{suffix}\n"
+            error_label = f"claude {subtype}{suffix}"
+            if api_error:
+                error_label += f": api status {api_error}"
+            return {"ok": False, "text": blocked, "error": error_label}
+        if text and "<tool_call>" in text and status_of(text, True) == "UNKNOWN":
+            has_review_sections = any(
+                has_contentful_section(extract_section(text, heading))
+                for heading in ("## Findings", "## Scope", "## Questions", "## Notes")
+            )
+            notes = "\n\n" + text.strip() if has_review_sections else ""
+            blocked = f"STATUS: BLOCKED\n\n## Scope\n- Claude Code returned pseudo tool calls without a completed review status.\n\n## Findings\n- None.\n\n## Questions\n- Rerun with Claude tools enabled, or force the reviewer to answer from supplied diff/context without tool calls.\n\n## Notes\n- Error: Claude output contained `<tool_call>` but no `STATUS:` line.{notes}\n"
+            return {"ok": False, "text": blocked, "error": "claude pseudo tool_call without review status"}
         if text:
-            return {"ok": result.returncode == 0, "text": text, "error": ""}
+            return {"ok": returncode == 0, "text": text, "error": ""}
     except json.JSONDecodeError:
         pass
-    return {"ok": False, "text": "", "error": result.stderr.strip() or result.stdout.strip() or "claude produced no JSON result"}
+    return {"ok": False, "text": "", "error": stderr.strip() or stdout.strip() or "claude produced no JSON result"}
 
 
 def write(path: Path, text: str) -> None:
@@ -876,11 +937,444 @@ def compact_prior_reviews(results: dict[str, dict[str, Any]], max_chars_per_revi
     return compacted
 
 
+def stable_id(prefix: str, *parts: str) -> str:
+    digest = hashlib.sha1("\n".join(parts).encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{prefix}-{digest}"
+
+
+def normalize_title(title: str) -> str:
+    lowered = re.sub(r"\bP[0-2]\b\s*:?", "", title, flags=re.IGNORECASE).lower()
+    lowered = re.sub(r"`([^`]+)`", r"\1", lowered)
+    lowered = re.sub(r"[^a-z0-9\u4e00-\u9fff./_-]+", " ", lowered)
+    words = [word for word in lowered.split() if word not in {"the", "a", "an", "and", "or", "of", "to", "in", "for", "with", "is", "are"}]
+    return " ".join(words).strip()
+
+
+def strongest_priority(values: list[str]) -> str:
+    ranked = [value for value in values if value in PRIORITY_RANK]
+    if not ranked:
+        return "P2"
+    return min(ranked, key=lambda value: PRIORITY_RANK[value])
+
+
+def priority_from_text(title: str, body: str) -> str:
+    for text in (title.strip(), body.strip()):
+        match = re.search(r"^\s*(P[0-2])\s*:", text, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    return "P2"
+
+
+def clean_finding_title(title: str, body: str) -> str:
+    cleaned = re.sub(r"^\s*P[0-2]\s*:\s*", "", title.strip(), flags=re.IGNORECASE).strip()
+    if cleaned:
+        return cleaned
+    for line in body.splitlines():
+        text = line.strip().lstrip("-* ").strip()
+        if text and text.lower() not in {"none", "none.", "无", "无。", "n/a"}:
+            return text[:140]
+    return "Untitled finding"
+
+
+def field_value(body: str, names: tuple[str, ...]) -> str:
+    labels = "|".join(re.escape(name) for name in names)
+    pattern = re.compile(rf"^\s*[-*]?\s*(?:{labels})\s*:\s*(.+)$", re.IGNORECASE)
+    for line in body.splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def evidence_refs_from_body(body: str) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    file_value = field_value(body, ("File", "Files", "Path", "Location", "文件", "位置"))
+    if file_value:
+        for item in re.split(r",|\s+and\s+", file_value):
+            text = re.split(r"\s+[—-]\s+", item.strip(), maxsplit=1)[0].strip().strip("`")
+            if not text or text.lower() in {"unknown", "n/a", "if known"}:
+                continue
+            match = re.match(r"(.+?)(?::(\d+))?$", text)
+            ref = match.group(1).strip() if match else text
+            line = int(match.group(2)) if match and match.group(2) else None
+            refs.append({"type": "file", "ref": ref, "line": line})
+    if not refs:
+        for match in re.finditer(r"(?<![\w/.-])([\w./-]+\.(?:py|md|yaml|yml|json|toml|ts|tsx|js|jsx|vue|go|rs))(?:\:(\d+))?", body):
+            ref = match.group(1)
+            line = int(match.group(2)) if match.group(2) else None
+            refs.append({"type": "file_mention", "ref": ref, "line": line})
+    doc_section = field_value(body, ("Doc section", "Documentation section", "Section", "章节", "文档章节"))
+    if doc_section:
+        refs.append({"type": "doc_section", "ref": doc_section[:240]})
+    behavior = field_value(body, ("Behavior", "Flow", "User flow", "行为", "流程"))
+    if behavior:
+        refs.append({"type": "behavior", "ref": behavior[:240]})
+    command = field_value(body, ("Command", "Command output", "命令", "命令输出"))
+    if command:
+        refs.append({"type": "command", "ref": command[:240]})
+    screenshot = field_value(body, ("Screenshot", "Image", "截图", "图片"))
+    if screenshot:
+        refs.append({"type": "screenshot", "ref": screenshot[:240]})
+    refs = unique_dicts(refs)
+    if refs:
+        return refs
+    evidence = field_value(body, ("Evidence", "证据"))
+    if evidence:
+        return [{"type": "reviewer_text", "ref": evidence[:240]}]
+    return []
+
+
+def split_finding_chunks(section: str) -> list[tuple[str, str]]:
+    chunks: list[tuple[str, str]] = []
+    title = ""
+    body: list[str] = []
+    for line in section.splitlines():
+        if line.startswith("### "):
+            if title or body:
+                chunks.append((title, "\n".join(body).strip()))
+            title = line[4:].strip()
+            body = []
+            continue
+        body.append(line)
+    if title or body:
+        chunks.append((title, "\n".join(body).strip()))
+
+    if len(chunks) == 1 and not chunks[0][0]:
+        bullet_chunks = []
+        for line in chunks[0][1].splitlines():
+            text = line.strip()
+            if text.startswith(("- ", "* ")):
+                value = text[2:].strip()
+                if value and value.lower() not in {"none", "none.", "无", "无。", "n/a"}:
+                    bullet_chunks.append((value[:140], value))
+        if bullet_chunks:
+            return bullet_chunks
+    return [(item_title, item_body) for item_title, item_body in chunks if has_contentful_section(item_title + "\n" + item_body)]
+
+
+def infer_card_review_type(review_type: str, title: str, body: str, refs: list[dict[str, Any]]) -> str:
+    if review_type != "mixed":
+        return review_type
+    if any(ref.get("type") == "doc_section" for ref in refs):
+        return "documentation"
+    if any(ref.get("type") == "behavior" for ref in refs):
+        return "design"
+    sample = f"{title}\n{body}".lower()
+    if any(word in sample for word in ("readme", "documentation", "docs", "protocol", "文档", "说明", "声明")):
+        return "documentation"
+    if any(word in sample for word in ("architecture", "module", "boundary", "api", "data flow", "架构", "边界", "模块")):
+        return "architecture"
+    if any(word in sample for word in ("design", "ui", "ux", "component", "flow", "screenshot", "设计", "交互", "组件", "流程")):
+        return "design"
+    if any(ref.get("type") in {"file", "file_mention"} for ref in refs):
+        return "code"
+    return "mixed"
+
+
+def card_from_chunk(source: str, section_heading: str, peer_status: str, title: str, body: str, review_type: str) -> dict[str, Any]:
+    priority = priority_from_text(title, body)
+    clean_title = clean_finding_title(title, body)
+    evidence_refs = evidence_refs_from_body(body)
+    card_review_type = infer_card_review_type(review_type, clean_title, body, evidence_refs)
+    evidence_summary = field_value(body, ("Evidence", "证据")) or body.strip()[:500]
+    impact = field_value(body, ("Impact", "影响")) or ""
+    suggested_action = field_value(body, ("Suggested fix", "Suggested action", "Recommended action", "Fix", "建议修复", "建议")) or ""
+    category = "recommendation"
+    if peer_status in {"rejected", "retracted"}:
+        category = "rejected"
+    elif peer_status == "needs_human":
+        category = "ambiguity"
+    elif card_review_type == "documentation":
+        category = "mismatch"
+    elif card_review_type in {"architecture", "design"}:
+        category = "risk"
+    elif priority in {"P0", "P1"}:
+        category = "defect"
+    card = {
+        "id": stable_id("raw", source, section_heading, clean_title, body[:1000]),
+        "title": clean_title,
+        "priority": priority,
+        "review_type": card_review_type,
+        "category": category,
+        "evidence_refs": evidence_refs,
+        "evidence_summary": evidence_summary,
+        "impact": impact,
+        "suggested_action": suggested_action,
+        "sources": [source],
+        "source_section": section_heading,
+        "peer_status": peer_status,
+        "confidence": "high" if peer_status == "confirmed" else "low" if peer_status == "needs_human" else "medium",
+        "raw_text": body.strip(),
+    }
+    return card
+
+
+def extract_finding_cards(results: dict[str, dict[str, Any]], review_type: str) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for source, result in results.items():
+        text = result.get("text") or ""
+        if not text:
+            continue
+        for section_heading, peer_status in FINDING_SECTIONS.items():
+            section = extract_section(text, section_heading)
+            if not has_contentful_section(section):
+                continue
+            for title, body in split_finding_chunks(section):
+                card = card_from_chunk(source, section_heading, peer_status, title, body, review_type)
+                cards.append(card)
+    return cards
+
+
+def dedupe_key(card: dict[str, Any]) -> str:
+    normalized_title = normalize_title(card.get("title", ""))
+    refs = card.get("evidence_refs") or []
+    for ref in refs:
+        if ref.get("type") == "file" and ref.get("ref"):
+            line = ref.get("line")
+            line_bucket = str(int(line) // 5) if isinstance(line, int) else ""
+            if line_bucket:
+                return f"file:{ref.get('ref')}:{line_bucket}:{normalized_title[:80]}"
+            return f"file:{ref.get('ref')}:{normalized_title[:80]}"
+    section_ref = next((ref for ref in refs if ref.get("type") == "doc_section" and ref.get("ref")), None)
+    if section_ref:
+        return f"doc:{section_ref['ref']}:{normalize_title(card.get('title', ''))[:80]}"
+    return f"title:{normalize_title(card.get('title', '') or card.get('evidence_summary', ''))[:120]}"
+
+
+def combine_peer_status(statuses: list[str]) -> str:
+    unique = set(statuses)
+    if "confirmed" in unique and "rejected" in unique:
+        return "unresolved"
+    if "rejected" in unique and unique.intersection({"one_sided", "needs_human"}):
+        return "unresolved"
+    if "confirmed" in unique:
+        return "confirmed"
+    if unique == {"rejected"}:
+        return "rejected"
+    if "needs_human" in unique:
+        return "needs_human"
+    return "one_sided"
+
+
+def reviewer_owner(source: str) -> str:
+    return source.split("_", 1)[0] if "_" in source else source
+
+
+def combine_group_status(group: list[dict[str, Any]]) -> str:
+    statuses = [card.get("peer_status", "one_sided") for card in group]
+    unique = set(statuses)
+    if "retracted" in unique:
+        retracted_owners = {
+            reviewer_owner(source)
+            for card in group
+            if card.get("peer_status") == "retracted"
+            for source in card.get("sources", [])
+        }
+        standing_owners = {
+            reviewer_owner(source)
+            for card in group
+            if card.get("peer_status") in {"confirmed", "rejected", "one_sided", "needs_human"}
+            for source in card.get("sources", [])
+        }
+        if not standing_owners or standing_owners.issubset(retracted_owners):
+            return "retracted"
+        return "unresolved"
+    return combine_peer_status(statuses)
+
+
+def unique_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    output = []
+    for item in items:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
+
+
+def merge_finding_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for card in cards:
+        groups.setdefault(dedupe_key(card), []).append(card)
+
+    merged: list[dict[str, Any]] = []
+    for key, group in groups.items():
+        priorities = [card.get("priority", "P2") for card in group]
+        priority = strongest_priority(priorities)
+        peer_status = combine_group_status(group)
+        if peer_status == "retracted":
+            continue
+        title_source = min(group, key=lambda card: PRIORITY_RANK.get(card.get("priority", "P2"), 2))
+        sources = sorted({source for card in group for source in card.get("sources", [])})
+        evidence_refs = unique_dicts([ref for card in group for ref in card.get("evidence_refs", [])])
+        evidence_summary = next((card.get("evidence_summary") for card in group if card.get("evidence_summary")), "")
+        impact = next((card.get("impact") for card in group if card.get("impact")), "")
+        suggested_action = next((card.get("suggested_action") for card in group if card.get("suggested_action")), "")
+        confidence = "high" if peer_status == "confirmed" else "low" if peer_status == "needs_human" else "medium"
+        merged.append(
+            {
+                "id": stable_id("finding", key, "|".join(sorted(card["id"] for card in group))),
+                "dedupe_key": key,
+                "title": title_source.get("title", "Untitled finding"),
+                "priority": priority,
+                "review_type": title_source.get("review_type", "mixed"),
+                "category": title_source.get("category", "recommendation"),
+                "evidence_refs": evidence_refs,
+                "evidence_summary": evidence_summary,
+                "impact": impact,
+                "suggested_action": suggested_action,
+                "sources": sources,
+                "source_cards": [card["id"] for card in group],
+                "peer_status": peer_status,
+                "confidence": confidence,
+            }
+        )
+    merged.sort(key=lambda card: (PRIORITY_RANK.get(card.get("priority", "P2"), 2), card.get("peer_status") != "confirmed", card.get("title", "")))
+    return merged
+
+
+def build_findings_data(results: dict[str, dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
+    raw_cards = extract_finding_cards(results, str(meta.get("review_type") or "mixed"))
+    merged_cards = merge_finding_cards(raw_cards)
+    return {
+        "meta": {
+            "profile": meta.get("profile"),
+            "mode": meta.get("mode"),
+            "scope": meta.get("resolved_scope"),
+            "review_type": meta.get("review_type"),
+            "arbiter": meta.get("arbiter", "none"),
+            "diff_truncated": bool(meta.get("diff_truncated")),
+        },
+        "raw": raw_cards,
+        "merged": merged_cards,
+    }
+
+
+def format_refs(refs: list[dict[str, Any]]) -> str:
+    if not refs:
+        return "reviewer output"
+    values = []
+    for ref in refs:
+        if ref.get("type") == "file":
+            suffix = f":{ref['line']}" if ref.get("line") is not None else ""
+            values.append(f"{ref.get('ref')}{suffix}")
+        else:
+            values.append(str(ref.get("ref")))
+    return "; ".join(values)
+
+
+def format_card(card: dict[str, Any]) -> list[str]:
+    lines = [f"### {card.get('priority', 'P2')}: {card.get('title', 'Untitled finding')}"]
+    lines.append(f"- Status: `{card.get('peer_status', 'one_sided')}`")
+    lines.append(f"- Confidence: `{card.get('confidence', 'medium')}`")
+    lines.append(f"- Sources: {', '.join(card.get('sources', [])) or 'unknown'}")
+    lines.append(f"- Evidence: {format_refs(card.get('evidence_refs') or [])}")
+    if card.get("evidence_summary"):
+        lines.append(f"- Evidence summary: {card['evidence_summary']}")
+    if card.get("impact"):
+        lines.append(f"- Impact: {card['impact']}")
+    if card.get("suggested_action"):
+        lines.append(f"- Recommended action: {card['suggested_action']}")
+    return lines
+
+
+def compact_findings_for_prompt(findings_data: dict[str, Any], max_chars: int = 80_000) -> str:
+    text = json.dumps(findings_data, ensure_ascii=False, indent=2)
+    if len(text) <= max_chars:
+        return text
+
+    meta = dict(findings_data.get("meta") or {})
+    meta["prompt_truncated"] = True
+    raw_cards = findings_data.get("raw") or []
+    merged_cards = findings_data.get("merged") or []
+    compact: dict[str, Any] = {
+        "meta": meta,
+        "raw_omitted_count": len(raw_cards),
+        "merged": merged_cards,
+    }
+    text = json.dumps(compact, ensure_ascii=False, indent=2)
+    if len(text) <= max_chars:
+        return text
+
+    kept: list[dict[str, Any]] = []
+    for card in merged_cards:
+        trial = {
+            "meta": meta,
+            "raw_omitted_count": len(raw_cards),
+            "merged_omitted_count": max(0, len(merged_cards) - len(kept) - 1),
+            "merged": [*kept, card],
+        }
+        trial_text = json.dumps(trial, ensure_ascii=False, indent=2)
+        if len(trial_text) > max_chars:
+            break
+        kept.append(card)
+    compact = {
+        "meta": meta,
+        "raw_omitted_count": len(raw_cards),
+        "merged_omitted_count": max(0, len(merged_cards) - len(kept)),
+        "merged": kept,
+    }
+    return json.dumps(compact, ensure_ascii=False, indent=2)
+
+
+def arbiter_prompt(task: str, meta: dict[str, Any], findings_data: dict[str, Any]) -> str:
+    compact_findings = compact_findings_for_prompt(findings_data)
+    return f"""
+You are an independent cross-review arbiter.
+
+Synthesize the deduplicated finding cards according to the selected review type.
+Do not downgrade documentation, design, architecture, or plan issues merely because they are not code defects.
+Separate confirmed defects, design risks, documentation mismatches, architecture concerns, rejected findings, and needs-human decisions.
+Do not edit files, apply patches, commit, or run destructive commands.
+
+Use this exact Markdown structure:
+
+STATUS: PASS | NEEDS_REVISION | BLOCKED
+
+## Final Fix List
+### P0/P1/P2: Title
+- Evidence:
+- Impact:
+- Recommended action:
+- Confidence:
+
+## Rejected Findings
+- Finding:
+- Reason:
+
+## Needs Human Decision
+- Question:
+- Why model evidence is insufficient:
+
+## Notes
+- Non-blocking observations.
+
+## Task
+
+{task}
+
+## Metadata
+
+```json
+{json.dumps(meta, ensure_ascii=False, indent=2)}
+```
+
+## Deduplicated Finding Cards
+
+```json
+{compact_findings}
+```
+""".strip()
+
+
 def build_review_summary(results: dict[str, dict[str, Any]], meta: dict[str, Any]) -> str:
     rounds = [
         ("Round 1: Independent Review", ["codex_initial", "claude_initial"]),
         ("Round 2: Updated Review And Peer Challenge", ["codex_response", "claude_response"]),
-        ("Round 3: Final Convergence", ["codex_final", "claude_final"]),
+        ("Round 3: Optional Reviewer Convergence", ["codex_final", "claude_final"]),
+        ("Optional Arbiter", ["arbiter"]),
     ]
     lines = [
         "# Cross Review Summary",
@@ -889,6 +1383,7 @@ def build_review_summary(results: dict[str, dict[str, Any]], meta: dict[str, Any
         f"- Mode: `{meta.get('mode')}`",
         f"- Scope: `{meta.get('resolved_scope')}`",
         f"- Review type: `{meta.get('review_type')}`",
+        f"- Arbiter: `{meta.get('arbiter', 'none')}`",
         f"- Diff truncated: `{str(meta.get('diff_truncated')).lower()}`",
         f"- Created at: `{meta.get('created_at')}`",
         "",
@@ -961,6 +1456,10 @@ def compact_run_data(results: dict[str, dict[str, Any]], meta: dict[str, Any]) -
         "codex_final": {"review": "codex-final.md", "raw": "codex-final.raw.jsonl"},
         "claude_final": {"review": "claude-final.md", "raw": "claude-final.raw.json"},
     }
+    if meta.get("arbiter") == "codex":
+        filenames["arbiter"] = {"review": "arbiter.md", "raw": "arbiter.raw.jsonl"}
+    elif meta.get("arbiter") == "claude":
+        filenames["arbiter"] = {"review": "arbiter.md", "raw": "arbiter.raw.json"}
     for name, result in results.items():
         compact["results"][name] = {
             "ok": bool(result.get("ok")),
@@ -983,7 +1482,7 @@ def build_reviewer_outputs(results: dict[str, dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_arbitration(results: dict[str, dict[str, Any]], truncated: bool, meta: dict[str, Any]) -> str:
+def build_arbitration(results: dict[str, dict[str, Any]], truncated: bool, meta: dict[str, Any], findings_data: dict[str, Any] | None = None, arbiter_text: str = "") -> str:
     def result_status(key: str) -> str:
         if key not in results:
             return "SKIPPED"
@@ -996,6 +1495,7 @@ def build_arbitration(results: dict[str, dict[str, Any]], truncated: bool, meta:
         f"- Mode: `{meta.get('mode')}`",
         f"- Scope: `{meta.get('resolved_scope')}`",
         f"- Review type: `{meta.get('review_type')}`",
+        f"- Arbiter: `{meta.get('arbiter', 'none')}`",
         f"- Diff truncated: `{str(truncated).lower()}`",
         f"- Codex initial: `{result_status('codex_initial')}`",
         f"- Claude initial: `{result_status('claude_initial')}`",
@@ -1008,6 +1508,75 @@ def build_arbitration(results: dict[str, dict[str, Any]], truncated: bool, meta:
         lines.append(f"- Codex final: `{status_of(results['codex_final'].get('text', ''), results['codex_final'].get('ok', False))}`")
     if "claude_final" in results:
         lines.append(f"- Claude final: `{status_of(results['claude_final'].get('text', ''), results['claude_final'].get('ok', False))}`")
+    if "arbiter" in results:
+        lines.append(f"- Arbiter result: `{status_of(results['arbiter'].get('text', ''), results['arbiter'].get('ok', False))}`")
+    if arbiter_text.strip():
+        lines.extend(
+            [
+                "",
+                "## Arbiter Decision",
+                "",
+                arbiter_text.strip(),
+                "",
+                "## Deterministic Finding Cards",
+                "",
+                "The sections below are the deterministic fallback view generated from structured finding cards.",
+                "",
+            ]
+        )
+
+    # Card-based arbitration view (primary path when findings_data is available)
+    merged_cards = findings_data.get("merged", []) if findings_data else []
+    if findings_data is not None:
+        final_cards = [card for card in merged_cards if card.get("peer_status") not in {"rejected", "needs_human", "unresolved"}]
+        rejected_cards = [card for card in merged_cards if card.get("peer_status") in {"rejected", "unresolved"}]
+        human_cards = [card for card in merged_cards if card.get("peer_status") == "needs_human"]
+        lines.extend(["", "## Candidate Or Final Issues", ""])
+        if final_cards:
+            for card in final_cards:
+                lines.extend(format_card(card))
+                lines.append("")
+        else:
+            lines.append("No candidate or final issue cards were extracted.")
+            lines.append("")
+
+        lines.extend(["## Disputed Or Rejected Issues", ""])
+        if rejected_cards:
+            for card in rejected_cards:
+                lines.extend(format_card(card))
+                lines.append("")
+        else:
+            lines.append("No rejected issue cards were extracted.")
+            lines.append("")
+
+        lines.extend(["## Needs Human", ""])
+        if human_cards:
+            for card in human_cards:
+                lines.extend(format_card(card))
+                lines.append("")
+        else:
+            lines.append("No needs-human cards were extracted.")
+            lines.append("")
+
+        blocked = [name for name, result in results.items() if not result.get("ok")]
+        lines.extend(
+            [
+                "## Blocked Reviewers",
+                "",
+                "\n".join(f"- `{name}`: {first_error(results[name]) or 'blocked'}" for name in blocked) if blocked else "None.",
+                "",
+                "## Recommended Next Action",
+                "",
+                "Work from `recommended-actions.md` for the action-oriented view. Treat one-sided findings as candidates until verified against the cited evidence, and treat unresolved findings as disputed until manually checked.",
+                "",
+                "## Reviewer Outputs",
+                "",
+                "Full reviewer outputs are stored in `reviewer-outputs.md`. Read that file only when raw reviewer text is needed.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+    # Section-based fallback (only when findings_data is not provided)
     lines.extend(
         [
             "",
@@ -1096,14 +1665,7 @@ def build_arbitration(results: dict[str, dict[str, Any]], truncated: bool, meta:
             "",
             "## Recommended Next Action",
             "",
-            "Fix confirmed P0/P1 issues first. If only disputed or needs-human items remain, inspect the cited files manually before changing code.",
-            "",
-            "## How To Use This Report",
-            "",
-            "1. Treat issues confirmed by both reviewers as the first fix list.",
-            "2. Treat one-sided, file-grounded P0/P1 issues as real until disproven by code inspection.",
-            "3. Treat disputed or context-dependent issues as requiring human or runtime confirmation.",
-            "4. Do not apply fixes automatically from this report; make a separate scoped implementation pass.",
+            "Work from `recommended-actions.md` for the action-oriented view. Treat one-sided findings as candidates until verified against the cited evidence, and treat unresolved findings as disputed until manually checked.",
             "",
             "## Reviewer Outputs",
             "",
@@ -1111,6 +1673,77 @@ def build_arbitration(results: dict[str, dict[str, Any]], truncated: bool, meta:
             "",
         ]
     )
+    return "\n".join(lines)
+
+
+def action_bucket(card: dict[str, Any]) -> str:
+    # peer_status takes priority over review_type: unresolved/needs_human cards
+    # go to dispute/human buckets regardless of their review lens.
+    if card.get("peer_status") == "unresolved":
+        return "Disputed - verify before acting"
+    review_type = card.get("review_type")
+    if card.get("peer_status") == "needs_human":
+        return "Human confirmation needed"
+    if review_type == "documentation":
+        return "Documentation updates"
+    if review_type == "design":
+        return "Design decisions"
+    if review_type == "architecture":
+        return "Architecture decisions"
+    if review_type == "code":
+        return "Code changes"
+    category = card.get("category")
+    if category == "mismatch":
+        return "Documentation updates"
+    if category == "ambiguity":
+        return "Human confirmation needed"
+    if category == "risk":
+        return "Architecture decisions"
+    if category == "recommendation":
+        return "Human confirmation needed"
+    return "Code changes"
+
+
+def build_recommended_actions(findings_data: dict[str, Any], meta: dict[str, Any]) -> str:
+    cards = findings_data.get("merged", [])
+    actionable = [card for card in cards if card.get("peer_status") != "rejected"]
+    buckets = [
+        "Code changes",
+        "Documentation updates",
+        "Design decisions",
+        "Architecture decisions",
+        "Disputed - verify before acting",
+        "Human confirmation needed",
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = {bucket: [] for bucket in buckets}
+    for card in actionable:
+        grouped.setdefault(action_bucket(card), []).append(card)
+
+    lines = [
+        "# Recommended Actions",
+        "",
+        f"- Profile: `{meta.get('profile')}`",
+        f"- Scope: `{meta.get('resolved_scope')}`",
+        f"- Review type: `{meta.get('review_type')}`",
+        f"- Arbiter: `{meta.get('arbiter', 'none')}`",
+        "",
+        "This file is an action-oriented view of the cross-review findings. It does not apply fixes automatically.",
+        "",
+    ]
+    for bucket in buckets:
+        lines.extend([f"## {bucket}", ""])
+        bucket_cards = grouped.get(bucket, [])
+        if not bucket_cards:
+            lines.extend(["None.", ""])
+            continue
+        for card in bucket_cards:
+            lines.append(f"### {card.get('priority', 'P2')}: {card.get('title', 'Untitled finding')}")
+            action = card.get("suggested_action") or card.get("evidence_summary") or "Verify the cited evidence and decide the minimal correction."
+            lines.append(f"- Action: {action}")
+            lines.append(f"- Evidence: {format_refs(card.get('evidence_refs') or [])}")
+            lines.append(f"- Status: `{card.get('peer_status', 'one_sided')}`")
+            lines.append(f"- Confidence: `{card.get('confidence', 'medium')}`")
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -1178,9 +1811,10 @@ def main() -> int:
     parser.add_argument("--keep-runs", type=int, default=10, help="Keep this many timestamped default report runs; older runs are pruned after success or failure. Use -1 to keep all.")
     parser.add_argument("--no-prune-reports", action="store_true", help="Do not prune old default report runs.")
     parser.add_argument("--rounds", type=int, choices=[1, 2, 3], default=None)
+    parser.add_argument("--arbiter", choices=["none", "codex", "claude"], default="none", help="Optional final LLM arbiter over deduplicated finding cards.")
     parser.add_argument("--skip-codex", action="store_true")
     parser.add_argument("--skip-claude", action="store_true")
-    parser.add_argument("--claude-tools", choices=["none", "default"], default="none")
+    parser.add_argument("--claude-tools", choices=["none", "default"], default=None)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--max-diff-chars", type=int, default=None)
     parser.add_argument("--max-full-chars", type=int, default=None)
@@ -1211,6 +1845,7 @@ def main() -> int:
     max_context_chars = args.max_full_chars if "full" in str(meta.get("resolved_scope")) else args.max_diff_chars
     diff, truncated = maybe_truncate(diff, max_context_chars)
     meta["review_type"] = review_type
+    meta["arbiter"] = args.arbiter
     meta["diff_truncated"] = truncated or bool(meta.get("collection_truncated"))
     meta["created_at"] = dt.datetime.now().astimezone().isoformat()
 
@@ -1314,8 +1949,25 @@ def main() -> int:
             progress(out_dir, f"Round 3: running {len(round3_jobs)} reviewer(s) in parallel")
             run_reviewer_jobs(out_dir, results, meta, round3_jobs, args.timeout)
 
-    progress(out_dir, "Writing arbitration.md, reviewer-outputs.md, review-summary.md, and run.json")
-    write(out_dir / "arbitration.md", build_arbitration(results, bool(meta.get("diff_truncated")), meta))
+    findings_data = build_findings_data(results, meta)
+    write(out_dir / "findings.json", json.dumps(findings_data, ensure_ascii=False, indent=2))
+
+    arbiter_text = ""
+    if args.arbiter != "none":
+        prompt = arbiter_prompt(task, meta, findings_data)
+        progress(out_dir, f"Arbiter: queued {args.arbiter} final synthesis over finding cards")
+        if args.arbiter == "codex":
+            result = run_codex(repo, prompt, out_dir / "arbiter.raw.jsonl", args.timeout)
+        else:
+            result = run_claude(repo, prompt, out_dir / "arbiter.raw.json", args.timeout, "none")
+        results["arbiter"] = result
+        write(out_dir / "arbiter.md", result.get("text") or f"BLOCKED: {result.get('error')}")
+        arbiter_text = result.get("text") or ""
+        progress(out_dir, result_brief("arbiter", result))
+
+    progress(out_dir, "Writing arbitration.md, recommended-actions.md, reviewer-outputs.md, review-summary.md, and run.json")
+    write(out_dir / "arbitration.md", build_arbitration(results, bool(meta.get("diff_truncated")), meta, findings_data, arbiter_text=arbiter_text))
+    write(out_dir / "recommended-actions.md", build_recommended_actions(findings_data, meta))
     write(out_dir / "reviewer-outputs.md", build_reviewer_outputs(results))
     refresh_review_summary(out_dir, results, meta)
     write(out_dir / "run.json", json.dumps(compact_run_data(results, meta), ensure_ascii=False, indent=2))
