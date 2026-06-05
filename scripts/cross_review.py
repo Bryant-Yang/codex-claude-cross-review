@@ -23,6 +23,7 @@ PROFILE_DEFAULTS = {
         "rounds": 1,
         "scope": "diff",
         "claude_tools": "readonly",
+        "claude_max_turns": 12,
         "max_diff_chars": 80_000,
         "max_full_chars": 120_000,
         "max_full_files": 60,
@@ -31,6 +32,7 @@ PROFILE_DEFAULTS = {
         "rounds": 2,
         "scope": "auto",
         "claude_tools": "readonly",
+        "claude_max_turns": 20,
         "max_diff_chars": 180_000,
         "max_full_chars": 220_000,
         "max_full_files": 120,
@@ -39,6 +41,7 @@ PROFILE_DEFAULTS = {
         "rounds": 3,
         "scope": "auto",
         "claude_tools": "readonly",
+        "claude_max_turns": 28,
         "max_diff_chars": 220_000,
         "max_full_chars": 260_000,
         "max_full_files": 160,
@@ -786,10 +789,10 @@ def run_codex(repo: Path, prompt: str, out_raw: Path, timeout: int) -> dict[str,
     return {"ok": ok, "text": text, "error": "" if ok else (result.stderr.strip() or "codex produced no agent message")}
 
 
-def run_claude(repo: Path, prompt: str, out_raw: Path, timeout: int, claude_tools: str) -> dict[str, Any]:
+def run_claude(repo: Path, prompt: str, out_raw: Path, timeout: int, claude_tools: str, claude_max_turns: int) -> dict[str, Any]:
     if not shutil.which("claude"):
         return {"ok": False, "text": "", "error": "claude command not found"}
-    cmd = ["claude", "-p", "--output-format", "json", "--max-turns", "8"]
+    cmd = ["claude", "-p", "--output-format", "json", "--max-turns", str(claude_max_turns)]
     if claude_tools == "none":
         cmd.extend(["--tools", ""])
     elif claude_tools == "readonly":
@@ -1868,6 +1871,7 @@ def main() -> int:
     parser.add_argument("--skip-codex", action="store_true")
     parser.add_argument("--skip-claude", action="store_true")
     parser.add_argument("--claude-tools", choices=["none", "readonly", "default"], default=None)
+    parser.add_argument("--claude-max-turns", type=int, default=None, help="Maximum Claude Code turns per reviewer call. Profile defaults: fast=12, normal=20, deep=28.")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--max-diff-chars", type=int, default=None)
     parser.add_argument("--max-full-chars", type=int, default=None)
@@ -1930,7 +1934,7 @@ def main() -> int:
         progress(out_dir, "Round 1: queued Claude independent review")
         round1_jobs["claude_initial"] = (
             run_claude,
-            (repo, claude_prompt, out_dir / "claude-initial.raw.json", args.timeout, args.claude_tools),
+            (repo, claude_prompt, out_dir / "claude-initial.raw.json", args.timeout, args.claude_tools, args.claude_max_turns),
             out_dir / "claude-initial.md",
         )
     else:
@@ -1971,7 +1975,7 @@ def main() -> int:
             )
             round2_jobs["claude_response"] = (
                 run_claude,
-                (repo, prompt, out_dir / "claude-response.raw.json", args.timeout, args.claude_tools),
+                (repo, prompt, out_dir / "claude-response.raw.json", args.timeout, args.claude_tools, args.claude_max_turns),
                 out_dir / "claude-response.md",
             )
         elif not args.skip_claude:
@@ -1996,7 +2000,7 @@ def main() -> int:
             prompt = final_prompt("Claude Code", task, diff, review_type, prior, tool_mode=args.claude_tools)
             round3_jobs["claude_final"] = (
                 run_claude,
-                (repo, prompt, out_dir / "claude-final.raw.json", args.timeout, args.claude_tools),
+                (repo, prompt, out_dir / "claude-final.raw.json", args.timeout, args.claude_tools, args.claude_max_turns),
                 out_dir / "claude-final.md",
             )
         if round3_jobs:
@@ -2013,7 +2017,7 @@ def main() -> int:
         if args.arbiter == "codex":
             result = run_codex(repo, prompt, out_dir / "arbiter.raw.jsonl", args.timeout)
         else:
-            result = run_claude(repo, prompt, out_dir / "arbiter.raw.json", args.timeout, "none")
+            result = run_claude(repo, prompt, out_dir / "arbiter.raw.json", args.timeout, "none", args.claude_max_turns)
         results["arbiter"] = result
         write(out_dir / "arbiter.md", result.get("text") or f"BLOCKED: {result.get('error')}")
         arbiter_text = result.get("text") or ""

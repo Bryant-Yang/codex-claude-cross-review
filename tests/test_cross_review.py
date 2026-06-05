@@ -187,6 +187,7 @@ class FindingCardTests(unittest.TestCase):
                 "rounds": None,
                 "scope": None,
                 "claude_tools": None,
+                "claude_max_turns": None,
                 "max_diff_chars": None,
                 "max_full_chars": None,
                 "max_full_files": None,
@@ -196,6 +197,7 @@ class FindingCardTests(unittest.TestCase):
         cross_review.apply_profile_defaults(args)
 
         self.assertEqual("readonly", args.claude_tools)
+        self.assertEqual(28, args.claude_max_turns)
 
     def test_none_tool_prompt_forbids_tool_attempts(self) -> None:
         prompt = cross_review.review_prompt(
