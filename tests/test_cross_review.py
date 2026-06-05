@@ -178,7 +178,7 @@ class FindingCardTests(unittest.TestCase):
         self.assertIn("STATUS: BLOCKED", result["text"])
         self.assertIn("pseudo tool_call", result["error"])
 
-    def test_deep_profile_keeps_claude_tools_disabled_by_default(self) -> None:
+    def test_deep_profile_uses_claude_readonly_tools_by_default(self) -> None:
         args = type(
             "Args",
             (),
@@ -195,7 +195,43 @@ class FindingCardTests(unittest.TestCase):
 
         cross_review.apply_profile_defaults(args)
 
-        self.assertEqual("none", args.claude_tools)
+        self.assertEqual("readonly", args.claude_tools)
+
+    def test_none_tool_prompt_forbids_tool_attempts(self) -> None:
+        prompt = cross_review.review_prompt(
+            "Claude Code",
+            "Review this diff.",
+            "diff --git a/a.py b/a.py",
+            "code",
+            tool_mode="none",
+        )
+
+        self.assertIn("Claude Code tools are disabled", prompt)
+        self.assertIn("Do not attempt tool calls", prompt)
+        self.assertNotIn("When tools are available", prompt)
+
+    def test_readonly_tool_prompt_names_allowed_tools(self) -> None:
+        prompt = cross_review.review_prompt(
+            "Claude Code",
+            "Review this diff.",
+            "diff --git a/a.py b/a.py",
+            "code",
+            tool_mode="readonly",
+        )
+
+        self.assertIn("read-only tools", prompt)
+        self.assertIn("Read,Grep,Glob", prompt)
+        self.assertIn("Do not edit files", prompt)
+
+    def test_status_parser_accepts_status_after_intro(self) -> None:
+        text = "\n".join(["preface"] * 12 + ["STATUS: PASS"])
+
+        self.assertEqual("PASS", cross_review.status_of(text, True))
+
+    def test_status_parser_ignores_template_placeholder(self) -> None:
+        text = "STATUS: PASS | NEEDS_REVISION | BLOCKED"
+
+        self.assertEqual("UNKNOWN", cross_review.status_of(text, True))
 
     def test_confirmed_and_rejected_duplicate_finding_is_unresolved(self) -> None:
         cards = [
@@ -288,6 +324,38 @@ class FindingCardTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("STATUS: BLOCKED", result["text"])
         self.assertIn("P1: Real issue", result["text"])
+
+    def test_claude_bracket_tool_output_without_status_is_blocked(self) -> None:
+        payload = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "I'll inspect first.\n\n[Tool: Grep]",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_raw = Path(tmpdir) / "claude.raw.json"
+            result = cross_review.parse_claude_result(0, json.dumps(payload), "", out_raw)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("STATUS: BLOCKED", result["text"])
+        self.assertIn("pseudo tool_call", result["error"])
+
+    def test_claude_tool_output_detection_is_case_insensitive(self) -> None:
+        payload = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "I'll inspect first.\n\n[tool: grep]",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_raw = Path(tmpdir) / "claude.raw.json"
+            result = cross_review.parse_claude_result(0, json.dumps(payload), "", out_raw)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("STATUS: BLOCKED", result["text"])
+        self.assertIn("pseudo tool_call", result["error"])
 
 
 if __name__ == "__main__":

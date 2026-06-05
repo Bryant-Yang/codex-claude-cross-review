@@ -79,7 +79,7 @@ python3 ~/.agents/skills/codex-claude-cross-review/scripts/cross_review.py \
   --profile deep
 ```
 
-`fast`/`normal`/`deep` 默认都让 Claude Code 只看传入的 diff/context，不启用工具。如需让 Claude Code 使用默认工具做证据核对，可显式加 `--claude-tools default`；这依赖 Claude Code 自身权限配置，不是脚本层面的只读沙箱。
+`fast`/`normal`/`deep` 默认让 Claude Code 使用脚本层面的只读工具集 `Read,Grep,Glob` 做证据核对，不开放编辑或 shell 命令。可用 `--claude-tools none` 强制只看传入的 diff/context；这种模式下脚本会要求 Claude 不尝试工具调用。只有确实需要 Claude Code 自身默认工具集时，才显式加 `--claude-tools default`；这依赖 Claude Code 自身权限配置，不是脚本层面的只读沙箱。
 
 带最终仲裁（`--arbiter` 可选 `none`/`codex`/`claude`，默认 `none`）：
 
